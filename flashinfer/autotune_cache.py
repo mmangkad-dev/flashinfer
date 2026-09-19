@@ -44,7 +44,7 @@ import json
 import os
 import pathlib
 import tempfile
-from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Set, Tuple, Union
 
 from .jit.core import logger
 
@@ -239,16 +239,20 @@ def _decode_key_fields(obj: Any) -> Optional[Any]:
     return None if decoded is _UNENCODABLE else decoded
 
 
-def _decode_policy(raw: Any) -> Optional[tuple]:
-    """Tuple form of a stored ``policy`` list, or None when absent/unusable.
+def _decode_policy(entry: Dict[str, Any]) -> Optional[tuple]:
+    """Tuple form of *entry*'s ``policy``, or None when the field is absent.
 
-    None is "no provenance recorded", which callers must read as the legacy
-    default -- never as "matches whatever is being requested".
+    None means "no provenance recorded", which callers must read as the legacy
+    default -- never as "matches whatever is being requested". It is reserved
+    for a genuinely absent field: a present but unusable value is corruption,
+    and raises so the entry is treated as a miss like any other structural
+    failure, rather than silently demoting to the legacy default.
     """
-    if raw is None:
+    if "policy" not in entry:
         return None
+    raw = entry["policy"]
     if not isinstance(raw, (list, tuple)):
-        return None
+        raise ValueError(f"malformed policy field ({raw!r})")
     return tuple(raw)
 
 
@@ -263,6 +267,15 @@ def _atomic_write_json(path: pathlib.Path, obj: Any) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+class CacheEntry(NamedTuple):
+    """One decoded store entry. Tuple-shaped, so it unpacks and compares as
+    ``(runner, tactic, policy)``."""
+
+    runner: str
+    tactic: Any
+    policy: Optional[tuple]
 
 
 class ManagedAutotuneCache:
@@ -291,7 +304,7 @@ class ManagedAutotuneCache:
         # Positive/negative lookup memos: at most one filesystem probe per
         # key per process.  A concurrent process's publish becomes visible
         # on the next attach.
-        self._hits: Dict[str, Tuple[str, Any, Optional[tuple]]] = {}
+        self._hits: Dict[str, "CacheEntry"] = {}
         self._missing: Set[str] = set()
 
     def _entry_path(self, file_key: str) -> pathlib.Path:
@@ -305,17 +318,16 @@ class ManagedAutotuneCache:
         if not manifest_path.exists():
             _atomic_write_json(manifest_path, self.manifest)
 
-    def lookup(self, file_key: str) -> Optional[Tuple[str, Any, Optional[tuple]]]:
-        """Return ``(runner_class_name, json_tactic, policy)`` for *file_key*,
-        or None.
+    def lookup(self, file_key: str) -> Optional["CacheEntry"]:
+        """Return the decoded :class:`CacheEntry` for *file_key*, or None.
 
-        *policy* is the profiling provenance recorded when the entry was
+        Its ``policy`` is the profiling provenance recorded when the entry was
         published (see :meth:`publish`), or ``None`` for an entry written
         before the field existed.  ``None`` means "assume the legacy default",
         which is the caller's decision, not this module's.
 
-        Any failure (missing file, malformed JSON, embedded-key mismatch)
-        is a cache miss.
+        Any failure (missing file, malformed JSON, embedded-key mismatch,
+        unusable provenance) is a cache miss.
         """
         hit = self._hits.get(file_key)
         if hit is not None:
@@ -330,11 +342,7 @@ class ManagedAutotuneCache:
             # entry must embed the exact canonical key it was stored under.
             if entry["key"] != file_key:
                 raise ValueError(f"embedded key mismatch (found {entry['key']!r})")
-            hit = (
-                entry["runner"],
-                entry["tactic"],
-                _decode_policy(entry.get("policy")),
-            )
+            hit = CacheEntry(entry["runner"], entry["tactic"], _decode_policy(entry))
             self._hits[file_key] = hit
             return hit
         except FileNotFoundError:
@@ -369,6 +377,15 @@ class ManagedAutotuneCache:
         Without it an entry is indistinguishable from a v1 config, which
         records no provenance and must therefore be assumed to be the legacy
         default.
+
+        The policy is deliberately NOT part of the key, so a key holds one
+        entry whatever it was measured under: re-tuning the same operation
+        alternately under two policies re-profiles and overwrites each time
+        rather than converging.  Both inputs to the policy are fixed in
+        source (each op's TuningConfig) or already in the environment hash
+        (the autotune_v2 MeasurementPolicy), so a deployment does not
+        alternate; keying by policy would multiply entries for a case that
+        does not arise.
         """
         try:
             self._ensure_dirs()
@@ -388,7 +405,7 @@ class ManagedAutotuneCache:
                 if encoded is not None:
                     entry["key_fields"] = encoded
             _atomic_write_json(self._entry_path(file_key), entry)
-            self._hits[file_key] = (runner_name, json_tactic, policy)
+            self._hits[file_key] = CacheEntry(runner_name, json_tactic, policy)
             self._missing.discard(file_key)
         except Exception as e:
             logger.warning(
@@ -411,12 +428,12 @@ class ManagedAutotuneCache:
         fewer preloaded entries, never an exception: the cache must not be able
         to break correctness.
         """
-        triples: list = []
+        records: list = []
         total = skipped = 0
         try:
             paths = sorted(self.entries_dir.glob("*.json"))
         except Exception:
-            return triples, 0, 0
+            return records, 0, 0
         for path in paths:
             total += 1
             try:
@@ -444,14 +461,16 @@ class ManagedAutotuneCache:
                 if path.stem != expect:
                     skipped += 1
                     continue
-                policy = _decode_policy(entry.get("policy"))
-                triples.append((fields, entry["runner"], entry["tactic"], policy))
+                policy = _decode_policy(entry)
+                records.append((fields, entry["runner"], entry["tactic"], policy))
                 # Warm the string-keyed memo too, so a lookup that does build a
                 # file_key (cold-miss path, load_from_file) also avoids the read.
-                self._hits[entry["key"]] = (entry["runner"], entry["tactic"], policy)
+                self._hits[entry["key"]] = CacheEntry(
+                    entry["runner"], entry["tactic"], policy
+                )
             except Exception:
                 skipped += 1
-        return triples, total, skipped
+        return records, total, skipped
 
     def clear_memo(self) -> None:
         """Forget memoized lookups (e.g. after AutoTuner.clear_cache)."""
@@ -529,8 +548,8 @@ def _hydrate_from_store(tuner, store) -> None:
     try:
         from .autotuner.autotuner import _json_to_tactic
 
-        triples, total, skipped = store.preload()
-        for key_fields, runner_name, json_tactic, policy in triples:
+        records, total, skipped = store.preload()
+        for key_fields, runner_name, json_tactic, policy in records:
             memo_key = (*marker, key_fields)
             tuner._managed_decoded.setdefault(
                 memo_key, (runner_name, _json_to_tactic(json_tactic), policy)
@@ -538,7 +557,7 @@ def _hydrate_from_store(tuner, store) -> None:
         tuner._preloaded_stores.add(marker)
         if total:
             logger.info(
-                f"[Autotuner]: Preloaded {len(triples)}/{total} managed cache "
+                f"[Autotuner]: Preloaded {len(records)}/{total} managed cache "
                 f"entries into memory"
                 + (f" ({skipped} not preloadable, served lazily)" if skipped else "")
             )
@@ -571,6 +590,7 @@ def autotune_v2_reload() -> None:
     with tuner._lock:
         tuner.profiling_cache.clear()
         tuner._winner_partitions.clear()
+        tuner._winner_policy_partitions.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.

@@ -100,8 +100,12 @@ fast. Nesting a plain `autotune()` inside or around it stays supported.
 - `<operation_hash>` = first 24 hex of `sha256(file_key)`, where `file_key` is the autotuner's
   canonical lookup key (op identity, bucketed dynamic dims, dtypes/layouts, runner extras).
   Repeated layers and different models share an entry whenever their keys are identical.
-- Each entry is `{"key": <file_key>, "runner": <class name>, "tactic": <json>}`. The embedded
-  key guards against hash collisions and foreign files.
+- Each entry is `{"key": <file_key>, "runner": <class name>, "tactic": <json>}` plus two
+  optional fields: `key_fields`, the structural form of the same key, present when it has a
+  round-trippable encoding and required for `preload()`; and `policy`, the profiling provenance
+  the winner was measured under (see §2.5). Both are additive in either direction — an entry
+  without them is still served, and a reader predating them ignores them — so neither warrants a
+  schema bump. The embedded key guards against hash collisions and foreign files.
 
 ### 2.3 Environment identity and invalidation
 
@@ -162,6 +166,18 @@ derived from it (`eager` → event timing with no delay kernel; otherwise standa
 `cold_l2` is orthogonal. The policy is part of the store's environment identity, so entries tuned
 under different policies land in different directories and never overwrite each other — which is
 what closes the eager-warmup / graph-serving aliasing.
+
+**Global policy vs per-op provenance.** That directory split covers only the *global*
+`MeasurementPolicy`. Profiling behavior also varies *per operation*, from each op's own
+`TuningConfig` (`use_cold_l2_cache`, `cuda_graph_profile_replays`) — most of the MoE surface asks
+for cold L2 itself. Those cannot be folded into the environment hash, which is fixed for the whole
+store, so they travel with the entry instead: `publish()` records them in the entry's `policy`
+field and a lookup compares them to what the caller is requesting, refusing a hit while tuning
+when they differ. Consequently entries measured under different *per-op* policies do share a key
+and overwrite each other; they are reconciled by that per-entry check rather than by placement. An
+entry with no `policy` field records no provenance and is assumed to be the legacy default —
+exactly the assumption made for a v1 config, which never recorded any. The blanket "a non-default
+policy skips every file-backed source while tuning" rule therefore applies to v1 configs only.
 
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.

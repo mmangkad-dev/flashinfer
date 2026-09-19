@@ -280,9 +280,26 @@ def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
     )
 
 
-def _tune_and_retune(monkeypatch, config):
-    """Tune *config* to disk, then simulate a restart and tune again.
-    Returns the profiling calls made by the second pass."""
+def test_an_unusable_policy_field_is_a_miss(cache_root):
+    """Absent provenance means "assume legacy default"; corrupt provenance is
+    a structural failure, and those are misses like any other."""
+    cache = ManagedAutotuneCache(manifest={"gpu": "test"})
+    key = "('op', 'Runner', ((1,),), ())"
+    cache.publish(key, "Runner", 7, policy=("x",))
+    path = next(iter(cache.entries_dir.glob("*.json")))
+    entry = json.loads(path.read_text())
+    entry["policy"] = "not-a-sequence"
+    path.write_text(json.dumps(entry))
+
+    assert ManagedAutotuneCache(manifest={"gpu": "test"}).lookup(key) is None
+
+
+def _tune_and_retune(monkeypatch, config, retune_config=None):
+    """Tune *config* to disk, then simulate a restart and tune again --
+    under *retune_config* when the second pass measures differently.
+
+    Returns ``(tactic, calls)`` from the second pass.
+    """
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     inputs = [torch.zeros(8, 16)]
     with autotune_v2():
@@ -292,7 +309,7 @@ def _tune_and_retune(monkeypatch, config):
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     with autotune_v2():
         _, tactic = AutoTuner.get().choose_one(
-            _OP, [DummyRunner((0, 1, 2))], config, inputs
+            _OP, [DummyRunner((0, 1, 2))], retune_config or config, inputs
         )
     return tactic, calls
 
@@ -315,23 +332,72 @@ def test_a_cold_l2_entry_is_reused_while_tuning(cache_root, monkeypatch):
 def test_an_entry_measured_under_another_policy_is_not_reused(cache_root, monkeypatch):
     """The provenance has to be checked, not just carried: a hot-L2 entry is
     not a hit for a cold-L2 request while tuning."""
+    _, calls = _tune_and_retune(
+        monkeypatch,
+        TuningConfig(),
+        retune_config=TuningConfig(use_cold_l2_cache=True),
+    )
+    assert calls, "a differently-measured entry was replayed as a hit"
+
+
+def test_a_promoted_entry_keeps_its_provenance_for_the_winner_cache(
+    cache_root, monkeypatch
+):
+    """Promoting a store entry into the winner cache must record the policy it
+    was measured under.
+
+    Source 1 serves the promoted winner on the next lookup and assumes the
+    legacy default when no policy is recorded for it -- so without that write a
+    cold-measured tactic is served as a hit for a hot-L2 tuning request, with
+    the per-entry gate never consulted.
+    """
+    cold = TuningConfig(use_cold_l2_cache=True)
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     inputs = [torch.zeros(8, 16)]
     with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], cold, inputs)
+
+    # Fresh process, then a replay pass whose hit promotes the cold-measured
+    # winner into the in-memory cache.
+    _fresh_process()
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2(mode="replay"):
         AutoTuner.get().choose_one(
             _OP, [DummyRunner((0, 1, 2))], TuningConfig(), inputs
         )
 
-    _fresh_process()
+    # Now tune hot: the promoted winner is cold-measured, so it is not a hit.
     calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     with autotune_v2():
         AutoTuner.get().choose_one(
-            _OP,
-            [DummyRunner((0, 1, 2))],
-            TuningConfig(use_cold_l2_cache=True),
-            inputs,
+            _OP, [DummyRunner((0, 1, 2))], TuningConfig(), inputs
         )
-    assert calls, "a differently-measured entry was replayed as a hit"
+    assert calls, "a promoted cold-measured winner was served for a hot-L2 request"
+
+
+def test_two_stores_do_not_share_one_provenance_table(cache_root, monkeypatch):
+    """Provenance is tracked per winner-cache partition, like the winners.
+
+    A flat table lets the store tuned last answer for another store's winner
+    under the same key, which is exactly the mismatch the provenance exists to
+    catch.
+    """
+    inputs = [torch.zeros(8, 16)]
+    cold, hot = TuningConfig(use_cold_l2_cache=True), TuningConfig()
+
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2(cache_root=str(cache_root / "A")):
+        _, a = AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], cold, inputs)
+
+    _install_fake_profile(monkeypatch, times={0: 1.0, 1: 3.0, 2: 2.0})
+    with autotune_v2(cache_root=str(cache_root / "B")):
+        _, b = AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], hot, inputs)
+    assert (a, b) == (1, 0)  # distinct winners, so a cross-store hit is visible
+
+    calls = _install_fake_profile(monkeypatch, times={0: 1.0, 1: 3.0, 2: 2.0})
+    with autotune_v2(cache_root=str(cache_root / "A")):
+        AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], hot, inputs)
+    assert calls, "store A's cold-measured winner was served for a hot-L2 request"
 
 
 def test_explicit_root_directory(cache_root, monkeypatch, tmp_path):

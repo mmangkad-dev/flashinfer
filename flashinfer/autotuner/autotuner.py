@@ -1544,7 +1544,11 @@ class AutoTuner:
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
+        # v1 flows only; every partitioned identity gets its own table below,
+        # so this must never be read without going through
+        # _winner_policy_cache().
         self._profiling_cache_policies: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
+        self._winner_policy_partitions: dict[tuple, dict] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -1811,22 +1815,45 @@ class AutoTuner:
         in legacy memory — and switching ``cache_root`` repopulates instead
         of silently reusing the old root's winners.
         """
-        store = self._active_managed_store
-        if store is not None:
-            key: tuple = (str(store.root), store.env_hash)
-        else:
-            policy = self._effective_measure_policy
-            fields = (
-                tuple(sorted(policy.manifest_fields().items()))
-                if policy is not None
-                else ()
-            )
-            if not fields:
-                return self.profiling_cache
-            key = ("__policy__", *fields)
+        key = self._winner_partition_key()
+        if key is None:
+            return self.profiling_cache
         part = self._winner_partitions.get(key)
         if part is None:
             part = self._winner_partitions[key] = {}
+        return part
+
+    def _winner_partition_key(self) -> tuple | None:
+        """Identity the in-memory winners belong to, or None for v1 flows."""
+        store = self._active_managed_store
+        if store is not None:
+            return (str(store.root), store.env_hash)
+        policy = self._effective_measure_policy
+        fields = (
+            tuple(sorted(policy.manifest_fields().items()))
+            if policy is not None
+            else ()
+        )
+        if not fields:
+            return None
+        return ("__policy__", *fields)
+
+    def _winner_policy_cache(self) -> dict:
+        """Measurement provenance for the winners in the matching partition.
+
+        Partitioned exactly like :meth:`_winner_cache`, and for the same
+        reason: one flat table lets one identity's policy answer for another
+        identity's winner under the same key, so a winner measured under one
+        policy is served as a hit for another -- the mismatch this provenance
+        exists to catch. v1 flows keep the flat table, which is the state
+        ``save_configs`` has always seen.
+        """
+        key = self._winner_partition_key()
+        if key is None:
+            return self._profiling_cache_policies
+        part = self._winner_policy_partitions.get(key)
+        if part is None:
+            part = self._winner_policy_partitions[key] = {}
         return part
 
     def _get_skip_ops_stack(self) -> list[frozenset[str]]:
@@ -1957,6 +1984,7 @@ class AutoTuner:
             #    policy is tracked separately because v1 partitions do not
             #    include cuda_graph_profile_replays.
             winners = self._winner_cache()
+            winner_policies = self._winner_policy_cache()
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -1968,9 +1996,7 @@ class AutoTuner:
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in winners:
-                    cached_policy = self._profiling_cache_policies.get(
-                        cache_key, default_policy
-                    )
+                    cached_policy = winner_policies.get(cache_key, default_policy)
                     if self.is_tuning_mode and cached_policy != requested_policy:
                         continue
                     tactic, stored_profile = winners[cache_key]
@@ -2035,7 +2061,7 @@ class AutoTuner:
                     if hit is None:
                         entry = managed_store.lookup(cache_key.file_key)
                         if entry is not None:
-                            hit = (entry[0], _json_to_tactic(entry[1]), entry[2])
+                            hit = entry._replace(tactic=_json_to_tactic(entry.tactic))
                             self._managed_decoded[memo_key] = hit
                     if hit is None:
                         continue
@@ -2079,7 +2105,10 @@ class AutoTuner:
                     # what this source already returns, and source 1 re-runs
                     # `_tactic_still_valid`, so revalidation is unchanged.
                     winners[cache_key] = (tactic, None)
-                    self._profiling_cache_policies[cache_key] = (
+                    # Load-bearing: source 1 serves this winner on the next
+                    # lookup and would otherwise assume the legacy default,
+                    # replaying a cold-measured tactic for a hot-L2 request.
+                    winner_policies[cache_key] = (
                         default_policy if entry_policy is None else entry_policy
                     )
                     return True, r_id, tactic, None
@@ -2232,9 +2261,10 @@ class AutoTuner:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
             # Apply the autotune_v2 measurement policy (how tactics are
             # timed during profiling); inert when no policy is active.
-            # Design doc: docs/design_docs/autotuner_v2.md §2.5 -- the policy
-            # is part of the store's environment identity, so entries tuned
-            # under different policies never overwrite each other.
+            # Design doc: docs/design_docs/autotuner_v2.md §2.5 -- this GLOBAL
+            # policy is part of the store's environment identity, so entries
+            # tuned under different ones never overwrite each other.  The
+            # per-op provenance below travels with the entry instead.
             measure_policy = self._effective_measure_policy
             if measure_policy is not None:
                 tuning_config = self._apply_measure_policy(
@@ -2558,14 +2588,22 @@ class AutoTuner:
                                 runners[runner_id].get_cache_key_extras(tensors),
                             )
                             self._winner_cache()[cache_key] = (tactic, p)
-                            self._profiling_cache_policies[cache_key] = (
+                            self._winner_policy_cache()[cache_key] = (
                                 self._profiling_policy(tuning_config)
                             )
                             self._dirty = True
                             self._dirty_seq += 1
                             publish_store = self._active_managed_store
                             if publish_store is not None:
-                                # Eager atomic publish; best-effort, never raises.
+                                # Eager atomic publish; best-effort, never
+                                # raises.  This refreshes the store's own memo
+                                # but not _managed_decoded, so a re-profile
+                                # driven by a policy mismatch leaves the
+                                # superseded entry in the tuner memo.  Harmless:
+                                # the new winner is in the partition source 1
+                                # reads first, and the stale one is only ever
+                                # served back to the policy it was measured
+                                # under.
                                 publish_store.publish(
                                     cache_key.file_key,
                                     cache_key.runner_class_name,
@@ -3933,6 +3971,7 @@ class AutoTuner:
             self.profiling_cache.clear()
             self._ranked_tactics_cache.clear()
             self._profiling_cache_policies.clear()
+            self._winner_policy_partitions.clear()
             self._file_configs.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
