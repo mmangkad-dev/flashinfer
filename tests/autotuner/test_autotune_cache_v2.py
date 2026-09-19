@@ -16,6 +16,7 @@ import torch
 
 import flashinfer.autotune_cache as autotune_cache_module
 from flashinfer.autotune_cache import (
+    CacheEntry,
     ManagedAutotuneCache,
     MeasurementPolicy,
     autotune_v2,
@@ -278,6 +279,30 @@ def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
         7,
         None,
     )
+
+
+def test_both_memo_writers_store_the_same_shape(cache_root, monkeypatch):
+    """The bulk preload and the lazy per-key read fill one dict, so an entry
+    must read the same way whichever put it there.
+
+    A plain tuple from either side type-checks and unpacks fine, so only a
+    warm attach against a populated store catches the divergence.
+    """
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], _CONFIG, inputs)
+
+    # Fresh process, then a warm attach: this populates the memo via preload.
+    tuner = _fresh_process()
+    with autotune_v2(mode="replay"):
+        pass
+    assert tuner._managed_decoded, "nothing was preloaded, so nothing is proven"
+    for entry in tuner._managed_decoded.values():
+        assert isinstance(entry, CacheEntry), f"preloaded {type(entry).__name__}"
+        # The attribute CacheEntry exists for, and the provenance the bulk
+        # read has to carry through for the per-entry gate to see it.
+        assert entry.policy is not None
 
 
 def test_an_unusable_policy_field_is_a_miss(cache_root):

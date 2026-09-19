@@ -552,7 +552,7 @@ def _hydrate_from_store(tuner, store) -> None:
         for key_fields, runner_name, json_tactic, policy in records:
             memo_key = (*marker, key_fields)
             tuner._managed_decoded.setdefault(
-                memo_key, (runner_name, _json_to_tactic(json_tactic), policy)
+                memo_key, CacheEntry(runner_name, _json_to_tactic(json_tactic), policy)
             )
         tuner._preloaded_stores.add(marker)
         if total:

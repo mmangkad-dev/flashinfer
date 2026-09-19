@@ -17,6 +17,7 @@ import tqdm
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Iterable,
@@ -36,6 +37,11 @@ from flashinfer.utils import (
 )
 
 from flashinfer.jit.core import logger
+
+if TYPE_CHECKING:
+    # Imported for typing only: autotune_cache reaches into this module at
+    # call time, so a module-level import here would close the cycle.
+    from flashinfer.autotune_cache import CacheEntry
 from flashinfer.version import __version__ as _flashinfer_version
 from flashinfer.autotuner.initializers import (
     TensorInitializer,
@@ -1607,9 +1613,10 @@ class AutoTuner:
         # free ProfilingCacheKey tuple (not the str() file_key), so the warm
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
-        self._managed_decoded: dict[
-            tuple[str, str, tuple], tuple[str, Any, tuple[Any, ...] | None]
-        ] = {}
+        # Both writers -- the bulk preload at attach and the lazy per-key read
+        # -- store the store's own CacheEntry, so `.policy` reads the same way
+        # whichever path filled it.
+        self._managed_decoded: dict[tuple[str, str, tuple], "CacheEntry"] = {}
         # Store identities already bulk-read into _managed_decoded, so a
         # re-attach of the same store does not re-scan the entries directory.
         self._preloaded_stores: set[tuple[str, str]] = set()
