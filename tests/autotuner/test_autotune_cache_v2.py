@@ -245,7 +245,93 @@ def test_lookup_negative_memo_and_publish_clears_it(cache_root):
     assert cache.lookup(key) is None
     assert key in cache._missing
     cache.publish(key, "Runner", 7)
-    assert cache.lookup(key) == ("Runner", 7)
+    # No policy passed -> no provenance recorded, which reads back as None.
+    assert cache.lookup(key) == ("Runner", 7, None)
+
+
+def test_publish_round_trips_the_profiling_policy(cache_root):
+    cache = ManagedAutotuneCache(manifest={"gpu": "test"})
+    key = "('op', 'Runner', ((1,),), ())"
+    policy = ("cuda_graph_profile_replays", None, "l2_cache_policy", "cold")
+    cache.publish(key, "Runner", 7, policy=policy)
+    assert cache.lookup(key) == ("Runner", 7, policy)
+
+    # And across a process boundary, through the entry file.
+    reread = ManagedAutotuneCache(manifest={"gpu": "test"})
+    assert reread.lookup(key) == ("Runner", 7, policy)
+
+
+def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
+    """Entries written before the policy field must keep their old meaning:
+    unknown provenance, so the legacy default is assumed -- never a match for
+    whatever is being requested."""
+    cache = ManagedAutotuneCache(manifest={"gpu": "test"})
+    key = "('op', 'Runner', ((1,),), ())"
+    cache.publish(key, "Runner", 7, policy=("x",))
+    path = next(iter(cache.entries_dir.glob("*.json")))
+    entry = json.loads(path.read_text())
+    del entry["policy"]
+    path.write_text(json.dumps(entry))
+
+    assert ManagedAutotuneCache(manifest={"gpu": "test"}).lookup(key) == (
+        "Runner",
+        7,
+        None,
+    )
+
+
+def _tune_and_retune(monkeypatch, config):
+    """Tune *config* to disk, then simulate a restart and tune again.
+    Returns the profiling calls made by the second pass."""
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], config, inputs)
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        _, tactic = AutoTuner.get().choose_one(
+            _OP, [DummyRunner((0, 1, 2))], config, inputs
+        )
+    return tactic, calls
+
+
+def test_a_cold_l2_entry_is_reused_while_tuning(cache_root, monkeypatch):
+    """An op whose own TuningConfig asks for cold L2 must still hit its
+    persisted entry.
+
+    Its measurement provenance is recorded per entry, so the rule that makes a
+    non-default policy bypass v1 configs -- which record none -- does not apply.
+    Without this, every cold-L2 op (the MoE runners ask for it themselves)
+    re-profiles on every start despite a valid entry.
+    """
+    cold = TuningConfig(use_cold_l2_cache=True)
+    tactic, calls = _tune_and_retune(monkeypatch, cold)
+    assert tactic == 1
+    assert calls == [], "a warm store must cost no profiling on restart"
+
+
+def test_an_entry_measured_under_another_policy_is_not_reused(cache_root, monkeypatch):
+    """The provenance has to be checked, not just carried: a hot-L2 entry is
+    not a hit for a cold-L2 request while tuning."""
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    inputs = [torch.zeros(8, 16)]
+    with autotune_v2():
+        AutoTuner.get().choose_one(
+            _OP, [DummyRunner((0, 1, 2))], TuningConfig(), inputs
+        )
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        AutoTuner.get().choose_one(
+            _OP,
+            [DummyRunner((0, 1, 2))],
+            TuningConfig(use_cold_l2_cache=True),
+            inputs,
+        )
+    assert calls, "a differently-measured entry was replayed as a hit"
 
 
 def test_explicit_root_directory(cache_root, monkeypatch, tmp_path):

@@ -1603,7 +1603,9 @@ class AutoTuner:
         # free ProfilingCacheKey tuple (not the str() file_key), so the warm
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
-        self._managed_decoded: dict[tuple[str, str, tuple], tuple[str, Any]] = {}
+        self._managed_decoded: dict[
+            tuple[str, str, tuple], tuple[str, Any, tuple[Any, ...] | None]
+        ] = {}
         # Store identities already bulk-read into _managed_decoded, so a
         # re-attach of the same store does not re-scan the entries directory.
         self._preloaded_stores: set[tuple[str, str]] = set()
@@ -1982,14 +1984,18 @@ class AutoTuner:
 
             # Persisted v1 entries do not record per-entry replay/L2 policy,
             # so a non-default policy requests fresh profiling while tuning.
-            use_file_config = not (
+            # Managed v2 entries DO record it and are gated per entry at 2.5;
+            # applying this blanket rule to them would make every operation
+            # whose own TuningConfig asks for cold L2 -- the MoE runners, among
+            # others -- re-profile on every start despite a valid entry.
+            use_v1_config = not (
                 self.is_tuning_mode and requested_policy != default_policy
             )
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
-            if use_file_config and self._file_configs:
+            if use_v1_config and self._file_configs:
                 for r_id, cache_key in runner_keys:
                     file_key = cache_key.file_key
                     if file_key in self._file_configs:
@@ -2017,7 +2023,7 @@ class AutoTuner:
             #     missing/malformed/key-mismatched entry is a MISS, never an
             #     error, and hits are memoized per store identity.
             managed_store = self._active_managed_store
-            if use_file_config and managed_store is not None:
+            if managed_store is not None:
                 store_id = (str(managed_store.root), managed_store.env_hash)
                 for r_id, cache_key in runner_keys:
                     # Warm path: memoise on the cheap hashable key_fields
@@ -2029,12 +2035,22 @@ class AutoTuner:
                     if hit is None:
                         entry = managed_store.lookup(cache_key.file_key)
                         if entry is not None:
-                            hit = (entry[0], _json_to_tactic(entry[1]))
+                            hit = (entry[0], _json_to_tactic(entry[1]), entry[2])
                             self._managed_decoded[memo_key] = hit
                     if hit is None:
                         continue
-                    runner_name, tactic = hit
+                    runner_name, tactic, entry_policy = hit
                     if runner_name != runners[r_id].__class__.__name__:
+                        continue
+                    # Same rule as the in-memory winners above: while tuning, an
+                    # entry measured under a different profiling policy is not a
+                    # hit.  An entry predating the field records no provenance,
+                    # so it is assumed legacy-default, exactly as a v1 config is.
+                    if (
+                        self.is_tuning_mode
+                        and (default_policy if entry_policy is None else entry_policy)
+                        != requested_policy
+                    ):
                         continue
                     if not self._tactic_still_valid(
                         runners[r_id], inputs, tactic, custom_op, "managed cache"
@@ -2063,6 +2079,9 @@ class AutoTuner:
                     # what this source already returns, and source 1 re-runs
                     # `_tactic_still_valid`, so revalidation is unchanged.
                     winners[cache_key] = (tactic, None)
+                    self._profiling_cache_policies[cache_key] = (
+                        default_policy if entry_policy is None else entry_policy
+                    )
                     return True, r_id, tactic, None
 
             # 3. Bundled package configs (legacy .py files)
@@ -2552,6 +2571,7 @@ class AutoTuner:
                                     cache_key.runner_class_name,
                                     _tactic_to_json(tactic),
                                     key_fields=cache_key.key_fields,
+                                    policy=self._profiling_policy(tuning_config),
                                 )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
