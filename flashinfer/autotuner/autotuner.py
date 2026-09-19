@@ -37,16 +37,16 @@ from flashinfer.utils import (
 )
 
 from flashinfer.jit.core import logger
-
-if TYPE_CHECKING:
-    # Imported for typing only: autotune_cache reaches into this module at
-    # call time, so a module-level import here would close the cycle.
-    from flashinfer.autotune_cache import CacheEntry
 from flashinfer.version import __version__ as _flashinfer_version
 from flashinfer.autotuner.initializers import (
     TensorInitializer,
     autotuner_initializer_rand_scaled,
 )
+
+if TYPE_CHECKING:
+    # autotune_cache imports from this module at call time, so a module-level
+    # import here would close the cycle.
+    from flashinfer.autotune_cache import CacheEntry
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
@@ -1550,9 +1550,8 @@ class AutoTuner:
         # Keep measurement provenance separate from the runtime cache key.
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
-        # v1 flows only; every partitioned identity gets its own table below,
-        # so this must never be read without going through
-        # _winner_policy_cache().
+        # v1 flows only; partitioned identities get their own table below, so
+        # read this through _winner_policy_cache(), never directly.
         self._profiling_cache_policies: dict[ProfilingCacheKey, tuple[Any, ...]] = {}
         self._winner_policy_partitions: dict[tuple, dict] = {}
         self.is_tuning_mode = False
@@ -1613,9 +1612,8 @@ class AutoTuner:
         # free ProfilingCacheKey tuple (not the str() file_key), so the warm
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
-        # Both writers -- the bulk preload at attach and the lazy per-key read
-        # -- store the store's own CacheEntry, so `.policy` reads the same way
-        # whichever path filled it.
+        # Both writers -- bulk preload at attach, lazy per-key read -- store a
+        # CacheEntry, so `.policy` reads the same way whichever filled it.
         self._managed_decoded: dict[tuple[str, str, tuple], "CacheEntry"] = {}
         # Store identities already bulk-read into _managed_decoded, so a
         # re-attach of the same store does not re-scan the entries directory.
@@ -1848,12 +1846,10 @@ class AutoTuner:
     def _winner_policy_cache(self) -> dict:
         """Measurement provenance for the winners in the matching partition.
 
-        Partitioned exactly like :meth:`_winner_cache`, and for the same
-        reason: one flat table lets one identity's policy answer for another
-        identity's winner under the same key, so a winner measured under one
-        policy is served as a hit for another -- the mismatch this provenance
-        exists to catch. v1 flows keep the flat table, which is the state
-        ``save_configs`` has always seen.
+        Must stay partitioned exactly like :meth:`_winner_cache`: one flat
+        table lets one identity's policy answer for another identity's winner
+        under the same key.  v1 flows keep the flat table ``save_configs``
+        has always seen.
         """
         key = self._winner_partition_key()
         if key is None:
@@ -2017,10 +2013,8 @@ class AutoTuner:
 
             # Persisted v1 entries do not record per-entry replay/L2 policy,
             # so a non-default policy requests fresh profiling while tuning.
-            # Managed v2 entries DO record it and are gated per entry at 2.5;
-            # applying this blanket rule to them would make every operation
-            # whose own TuningConfig asks for cold L2 -- the MoE runners, among
-            # others -- re-profile on every start despite a valid entry.
+            # v2 entries record it and are gated per entry at 2.5, so this
+            # covers v1 configs only.
             use_v1_config = not (
                 self.is_tuning_mode and requested_policy != default_policy
             )
@@ -2075,10 +2069,8 @@ class AutoTuner:
                     runner_name, tactic, entry_policy = hit
                     if runner_name != runners[r_id].__class__.__name__:
                         continue
-                    # Same rule as the in-memory winners above: while tuning, an
-                    # entry measured under a different profiling policy is not a
-                    # hit.  An entry predating the field records no provenance,
-                    # so it is assumed legacy-default, exactly as a v1 config is.
+                    # Same rule as the in-memory winners above; no recorded
+                    # provenance means legacy-default, as for a v1 config.
                     if (
                         self.is_tuning_mode
                         and (default_policy if entry_policy is None else entry_policy)
@@ -2112,9 +2104,8 @@ class AutoTuner:
                     # what this source already returns, and source 1 re-runs
                     # `_tactic_still_valid`, so revalidation is unchanged.
                     winners[cache_key] = (tactic, None)
-                    # Load-bearing: source 1 serves this winner on the next
-                    # lookup and would otherwise assume the legacy default,
-                    # replaying a cold-measured tactic for a hot-L2 request.
+                    # Source 1 serves this winner next time and would otherwise
+                    # assume legacy-default, replaying it under another policy.
                     winner_policies[cache_key] = (
                         default_policy if entry_policy is None else entry_policy
                     )
@@ -2268,10 +2259,9 @@ class AutoTuner:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
             # Apply the autotune_v2 measurement policy (how tactics are
             # timed during profiling); inert when no policy is active.
-            # Design doc: docs/design_docs/autotuner_v2.md §2.5 -- this GLOBAL
-            # policy is part of the store's environment identity, so entries
-            # tuned under different ones never overwrite each other.  The
-            # per-op provenance below travels with the entry instead.
+            # Design doc: docs/design_docs/autotuner_v2.md §2.5 -- this global
+            # policy is part of the store's environment identity; the per-op
+            # provenance travels with the entry instead.
             measure_policy = self._effective_measure_policy
             if measure_policy is not None:
                 tuning_config = self._apply_measure_policy(
@@ -2602,15 +2592,10 @@ class AutoTuner:
                             self._dirty_seq += 1
                             publish_store = self._active_managed_store
                             if publish_store is not None:
-                                # Eager atomic publish; best-effort, never
-                                # raises.  This refreshes the store's own memo
-                                # but not _managed_decoded, so a re-profile
-                                # driven by a policy mismatch leaves the
-                                # superseded entry in the tuner memo.  Harmless:
-                                # the new winner is in the partition source 1
-                                # reads first, and the stale one is only ever
-                                # served back to the policy it was measured
-                                # under.
+                                # Eager atomic publish; best-effort, never raises.
+                                # Refreshes the store memo, not _managed_decoded:
+                                # a superseded entry there is only ever served
+                                # back to the policy that measured it.
                                 publish_store.publish(
                                     cache_key.file_key,
                                     cache_key.runner_class_name,

@@ -240,13 +240,11 @@ def _decode_key_fields(obj: Any) -> Optional[Any]:
 
 
 def _decode_policy(entry: Dict[str, Any]) -> Optional[tuple]:
-    """Tuple form of *entry*'s ``policy``, or None when the field is absent.
+    """Tuple form of *entry*'s ``policy``; None only when the field is absent.
 
-    None means "no provenance recorded", which callers must read as the legacy
-    default -- never as "matches whatever is being requested". It is reserved
-    for a genuinely absent field: a present but unusable value is corruption,
-    and raises so the entry is treated as a miss like any other structural
-    failure, rather than silently demoting to the legacy default.
+    None means "no provenance recorded", which callers read as the legacy
+    default. A present but unusable value raises, making the entry a miss
+    rather than silently demoting it to that default.
     """
     if "policy" not in entry:
         return None
@@ -321,11 +319,6 @@ class ManagedAutotuneCache:
     def lookup(self, file_key: str) -> Optional["CacheEntry"]:
         """Return the decoded :class:`CacheEntry` for *file_key*, or None.
 
-        Its ``policy`` is the profiling provenance recorded when the entry was
-        published (see :meth:`publish`), or ``None`` for an entry written
-        before the field existed.  ``None`` means "assume the legacy default",
-        which is the caller's decision, not this module's.
-
         Any failure (missing file, malformed JSON, embedded-key mismatch,
         unusable provenance) is a cache miss.
         """
@@ -371,21 +364,10 @@ class ManagedAutotuneCache:
         callers that predate preloading keep working unchanged.
 
         *policy* is the profiling provenance the winner was measured under
-        (replay count, L2 state).  It cannot live in the environment hash --
-        it varies per operation, from each op's own TuningConfig -- so it is
-        recorded per entry, and a consumer measuring differently can tell.
-        Without it an entry is indistinguishable from a v1 config, which
-        records no provenance and must therefore be assumed to be the legacy
-        default.
-
-        The policy is deliberately NOT part of the key, so a key holds one
-        entry whatever it was measured under: re-tuning the same operation
-        alternately under two policies re-profiles and overwrites each time
-        rather than converging.  Both inputs to the policy are fixed in
-        source (each op's TuningConfig) or already in the environment hash
-        (the autotune_v2 MeasurementPolicy), so a deployment does not
-        alternate; keying by policy would multiply entries for a case that
-        does not arise.
+        (replay count, L2 state).  It varies per operation, so it cannot live
+        in the environment hash and is recorded per entry instead; it is not
+        part of the key, so entries measured differently overwrite rather than
+        coexist.  See the design doc, section 2.5.
         """
         try:
             self._ensure_dirs()

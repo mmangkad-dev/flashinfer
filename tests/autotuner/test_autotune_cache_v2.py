@@ -263,9 +263,8 @@ def test_publish_round_trips_the_profiling_policy(cache_root):
 
 
 def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
-    """Entries written before the policy field must keep their old meaning:
-    unknown provenance, so the legacy default is assumed -- never a match for
-    whatever is being requested."""
+    """An entry predating the policy field keeps its old meaning: unknown
+    provenance, so the legacy default is assumed."""
     cache = ManagedAutotuneCache(manifest={"gpu": "test"})
     key = "('op', 'Runner', ((1,),), ())"
     cache.publish(key, "Runner", 7, policy=("x",))
@@ -282,11 +281,10 @@ def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
 
 
 def test_both_memo_writers_store_the_same_shape(cache_root, monkeypatch):
-    """The bulk preload and the lazy per-key read fill one dict, so an entry
-    must read the same way whichever put it there.
+    """An entry reads the same way whichever writer filled the memo.
 
-    A plain tuple from either side type-checks and unpacks fine, so only a
-    warm attach against a populated store catches the divergence.
+    A plain tuple unpacks and type-checks identically, so only a warm attach
+    against a populated store catches the divergence.
     """
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     inputs = [torch.zeros(8, 16)]
@@ -306,8 +304,8 @@ def test_both_memo_writers_store_the_same_shape(cache_root, monkeypatch):
 
 
 def test_an_unusable_policy_field_is_a_miss(cache_root):
-    """Absent provenance means "assume legacy default"; corrupt provenance is
-    a structural failure, and those are misses like any other."""
+    """Corrupt provenance is a structural failure, so a miss -- not a silent
+    demotion to the legacy default that an absent field means."""
     cache = ManagedAutotuneCache(manifest={"gpu": "test"})
     key = "('op', 'Runner', ((1,),), ())"
     cache.publish(key, "Runner", 7, policy=("x",))
@@ -320,11 +318,8 @@ def test_an_unusable_policy_field_is_a_miss(cache_root):
 
 
 def _tune_and_retune(monkeypatch, config, retune_config=None):
-    """Tune *config* to disk, then simulate a restart and tune again --
-    under *retune_config* when the second pass measures differently.
-
-    Returns ``(tactic, calls)`` from the second pass.
-    """
+    """Tune *config* to disk, restart, and tune again -- under *retune_config*
+    when the second pass measures differently; returns its (tactic, calls)."""
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     inputs = [torch.zeros(8, 16)]
     with autotune_v2():
@@ -340,14 +335,9 @@ def _tune_and_retune(monkeypatch, config, retune_config=None):
 
 
 def test_a_cold_l2_entry_is_reused_while_tuning(cache_root, monkeypatch):
-    """An op whose own TuningConfig asks for cold L2 must still hit its
-    persisted entry.
-
-    Its measurement provenance is recorded per entry, so the rule that makes a
-    non-default policy bypass v1 configs -- which record none -- does not apply.
-    Without this, every cold-L2 op (the MoE runners ask for it themselves)
-    re-profiles on every start despite a valid entry.
-    """
+    """An op whose own TuningConfig asks for cold L2 still hits its persisted
+    entry: its provenance is recorded per entry, so the rule that bypasses
+    provenance-free v1 configs does not reach it."""
     cold = TuningConfig(use_cold_l2_cache=True)
     tactic, calls = _tune_and_retune(monkeypatch, cold)
     assert tactic == 1
@@ -368,13 +358,11 @@ def test_an_entry_measured_under_another_policy_is_not_reused(cache_root, monkey
 def test_a_promoted_entry_keeps_its_provenance_for_the_winner_cache(
     cache_root, monkeypatch
 ):
-    """Promoting a store entry into the winner cache must record the policy it
-    was measured under.
+    """Promoting a store entry records the policy it was measured under.
 
-    Source 1 serves the promoted winner on the next lookup and assumes the
-    legacy default when no policy is recorded for it -- so without that write a
-    cold-measured tactic is served as a hit for a hot-L2 tuning request, with
-    the per-entry gate never consulted.
+    Source 1 serves the promoted winner next and assumes the legacy default
+    without it, so a cold-measured tactic would be served for a hot-L2 request
+    with the per-entry gate never consulted.
     """
     cold = TuningConfig(use_cold_l2_cache=True)
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
@@ -404,8 +392,7 @@ def test_two_stores_do_not_share_one_provenance_table(cache_root, monkeypatch):
     """Provenance is tracked per winner-cache partition, like the winners.
 
     A flat table lets the store tuned last answer for another store's winner
-    under the same key, which is exactly the mismatch the provenance exists to
-    catch.
+    under the same key.
     """
     inputs = [torch.zeros(8, 16)]
     cold, hot = TuningConfig(use_cold_l2_cache=True), TuningConfig()
