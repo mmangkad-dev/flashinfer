@@ -139,8 +139,8 @@ maintaining a migration path for data that is, by construction, an optimization.
   `FileLock` for single-flight: that is correct there and wrong here. Compiling the same kernel
   twice wastes minutes of CPU, whereas ranks tune *inside collectives*, so a cross-rank lock
   would either serialize warmup or deadlock it. Redundant measurement is the cheaper failure.
-- **Invalid is a miss, never an error.** A missing file, malformed JSON, or an embedded-key
-  mismatch logs a warning and returns "not found". A corrupt entry costs one retune, not a dead
+- **Invalid is a miss, never an error.** A missing file, malformed JSON, an embedded-key
+  mismatch, or an unusable `policy` field (§2.5) logs a warning and returns "not found". A corrupt entry costs one retune, not a dead
   server, and cannot take the other entries with it.
 - **One filesystem probe per key per process.** Positive and negative lookups are memoized
   inside the store object — never in v1's `_file_configs` — so the serving hot path touches
@@ -176,8 +176,9 @@ field and a lookup compares them to what the caller is requesting, refusing a hi
 when they differ. Consequently entries measured under different *per-op* policies do share a key
 and overwrite each other; they are reconciled by that per-entry check rather than by placement. An
 entry with no `policy` field records no provenance and is assumed to be the legacy default —
-exactly the assumption made for a v1 config, which never recorded any. The blanket "a non-default
-policy skips every file-backed source while tuning" rule therefore applies to v1 configs only.
+exactly the assumption made for a v1 config, which never recorded any. While tuning, a request
+whose policy differs from the legacy default skips v1 configs wholesale, because none of them can
+say how they were measured; managed entries are checked one by one instead.
 
 `"auto"` currently preserves legacy behavior. Flipping the default to `"cuda_graph"` (the
 dominant serving mode) is gated on validating capture-safety across the op suite.

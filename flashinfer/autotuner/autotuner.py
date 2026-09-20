@@ -1848,8 +1848,8 @@ class AutoTuner:
 
         Must stay partitioned exactly like :meth:`_winner_cache`: one flat
         table lets one identity's policy answer for another identity's winner
-        under the same key.  v1 flows keep the flat table ``save_configs``
-        has always seen.
+        under the same key.  v1 flows keep the flat table, so source 1
+        behaves for them exactly as before.
         """
         key = self._winner_partition_key()
         if key is None:
@@ -2593,9 +2593,11 @@ class AutoTuner:
                             publish_store = self._active_managed_store
                             if publish_store is not None:
                                 # Eager atomic publish; best-effort, never raises.
-                                # Refreshes the store memo, not _managed_decoded:
-                                # a superseded entry there is only ever served
-                                # back to the policy that measured it.
+                                # _managed_decoded deliberately keeps the
+                                # superseded entry: it is only ever served back
+                                # to the policy that measured it, and refreshing
+                                # it here makes alternating policies re-profile
+                                # on every step instead of every other one.
                                 publish_store.publish(
                                     cache_key.file_key,
                                     cache_key.runner_class_name,

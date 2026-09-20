@@ -16,13 +16,13 @@ import torch
 
 import flashinfer.autotune_cache as autotune_cache_module
 from flashinfer.autotune_cache import (
-    CacheEntry,
     ManagedAutotuneCache,
     MeasurementPolicy,
     autotune_v2,
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    DynamicTensorSpec,
     TuningConfig,
     autotune,
 )
@@ -280,11 +280,12 @@ def test_an_entry_without_provenance_is_assumed_legacy_default(cache_root):
     )
 
 
-def test_both_memo_writers_store_the_same_shape(cache_root, monkeypatch):
-    """An entry reads the same way whichever writer filled the memo.
+def test_a_preloaded_entry_exposes_its_provenance_by_attribute(cache_root, monkeypatch):
+    """The memo's two writers agree, so ``.policy`` reads on either's entries.
 
-    A plain tuple unpacks and type-checks identically, so only a warm attach
-    against a populated store catches the divergence.
+    A plain tuple unpacks and passes mypy identically, and only a warm attach
+    against a populated store goes through the bulk writer, so nothing else
+    catches the divergence.
     """
     _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
     inputs = [torch.zeros(8, 16)]
@@ -297,9 +298,8 @@ def test_both_memo_writers_store_the_same_shape(cache_root, monkeypatch):
         pass
     assert tuner._managed_decoded, "nothing was preloaded, so nothing is proven"
     for entry in tuner._managed_decoded.values():
-        assert isinstance(entry, CacheEntry), f"preloaded {type(entry).__name__}"
-        # The attribute CacheEntry exists for, and the provenance the bulk
-        # read has to carry through for the per-entry gate to see it.
+        # Attribute access is the point: it raises on a plain tuple, and the
+        # provenance has to survive the bulk read for the gate to see it.
         assert entry.policy is not None
 
 
@@ -386,6 +386,39 @@ def test_a_promoted_entry_keeps_its_provenance_for_the_winner_cache(
             _OP, [DummyRunner((0, 1, 2))], TuningConfig(), inputs
         )
     assert calls, "a promoted cold-measured winner was served for a hot-L2 request"
+
+
+def test_alternating_policies_reprofile_only_the_unstored_one(cache_root, monkeypatch):
+    """A key holds one entry whatever measured it, so alternating policies
+    re-profile the one that is not on disk -- but not the one that is.
+
+    Nesting ``autotune(cuda_graph_profile_replays=...)`` inside a v2 context is
+    supported, so this does happen. The decoded memo keeps the superseded entry
+    to make it affordable: refreshing it on publish re-profiles on every step
+    instead of every other one.
+    """
+    inputs = [torch.zeros(8, 16)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec((0,), (0,), (8,), lambda x: 8),),
+        use_cuda_graph=True,
+    )
+    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner((0, 1, 2))], config, inputs)
+
+    _fresh_process()
+    per_step = []
+    with autotune_v2():
+        for replays in (3, 1, 3, 1, 3):
+            calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+            with autotune(True, cuda_graph_profile_replays=replays):
+                AutoTuner.get().choose_one(
+                    _OP, [DummyRunner((0, 1, 2))], config, inputs
+                )
+            per_step.append(len(calls))
+
+    assert per_step[1::2] == [0, 0], "the stored policy should not re-profile"
+    assert all(n > 0 for n in per_step[0::2]), "the other policy has no entry"
 
 
 def test_two_stores_do_not_share_one_provenance_table(cache_root, monkeypatch):
