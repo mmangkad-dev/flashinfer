@@ -128,9 +128,10 @@ def check_selection(result, permute_info, ref_scores, top_k):
     )
 
 
-def check_permutation(result, permute_info, num_tokens, top_k):
+def check_permutation(result, permute_info, num_tokens, width):
     """Permutation outputs must be internally consistent with the oracle's
-    per-expert padded segments, without assuming intra-expert ordering."""
+    per-expert padded segments, without assuming intra-expert ordering.
+    ``width`` is the slots per token: top_k plus any fused shared experts."""
     device = result.topk_ids.device
     padded_size = int(result.total_num_padded_tokens.item())
     assert padded_size == permute_info["permutedBufferSize"], (
@@ -144,7 +145,7 @@ def check_permutation(result, permute_info, num_tokens, top_k):
 
     # Round-trip: the permuted slot must map back to the owning token.
     p2t = result.permuted_idx_to_token_idx.long()
-    tokens = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+    tokens = torch.arange(num_tokens, device=device).repeat_interleave(width)
     assert (p2t[e2p] == tokens).all(), "permuted->token round trip failed"
 
     # Each expanded (token, k) slot must land in its expert's padded segment.
@@ -169,7 +170,14 @@ def run_and_check(
     **kwargs,
 ):
     num_tokens = logits.shape[0]
+    num_shared = kwargs.get("num_fused_shared_experts", 0)
     permute_info, ref_scores = reference()
+    if num_shared:
+        # Fused shared-expert slots (ids E..E+S-1) always carry weight 1.0.
+        shared_scores = torch.ones(
+            num_tokens, num_shared, dtype=ref_scores.dtype, device=ref_scores.device
+        )
+        ref_scores = torch.cat((ref_scores, shared_scores), dim=1)
     result = trtllm_gen_routing(
         logits,
         routing_bias,
@@ -179,7 +187,7 @@ def run_and_check(
         **kwargs,
     )
     check_selection(result, permute_info, ref_scores, top_k)
-    check_permutation(result, permute_info, num_tokens, top_k)
+    check_permutation(result, permute_info, num_tokens, top_k + num_shared)
 
 
 # (method, reference fn) for the methods routed through routingCustom with no
@@ -240,7 +248,7 @@ def test_custom_routing_methods(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 150])
+@pytest.mark.parametrize("num_tokens", [1, 8, 150, 1500])
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,top_k",
     [
@@ -260,6 +268,7 @@ def test_custom_routing_methods(
 @pytest.mark.parametrize("tile_tokens_dim", [8, 32])
 @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 def test_deepseekv3_routing(
     num_tokens,
     num_experts,
@@ -269,9 +278,19 @@ def test_deepseekv3_routing(
     tile_tokens_dim,
     logits_dtype,
     bias_dtype,
+    num_fused_shared_experts,
 ):
     if num_experts > 256 and logits_dtype == torch.bfloat16:
         pytest.skip("tie-free logits construction needs float32 beyond 256 experts")
+    # Shared experts on no-groups rows take the ungrouped DeepSeek kernel instead
+    # of routingCustom; grouped fused-shared routing is covered end to end.
+    if num_fused_shared_experts and n_group > 1:
+        pytest.skip("fused shared experts are exercised on the no-groups rows")
+    if num_fused_shared_experts and num_experts + num_fused_shared_experts > 512:
+        pytest.skip("routed + fused shared experts must be <= 512")
+    # 1500 tokens reaches the cooperative / multi-kernel permutation paths.
+    if num_tokens == 1500 and not num_fused_shared_experts:
+        pytest.skip("large-batch permutation is covered by test_large_batch_smoke")
     routed_scaling = 2.5
     seed = stable_seed("dsv3", num_tokens, num_experts, n_group, top_k)
     logits = make_logits(num_tokens, num_experts, logits_dtype, seed)
@@ -279,7 +298,14 @@ def test_deepseekv3_routing(
     run_and_check(
         RoutingMethodType.DeepSeekV3,
         lambda: routing_reference_no_aux(
-            logits, bias, top_k, n_group, topk_group, routed_scaling, tile_tokens_dim
+            logits,
+            bias,
+            top_k,
+            n_group,
+            topk_group,
+            routed_scaling,
+            tile_tokens_dim,
+            num_fused_shared_experts=num_fused_shared_experts,
         ),
         logits,
         top_k,
@@ -288,6 +314,7 @@ def test_deepseekv3_routing(
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling_factor=routed_scaling,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
 
 
@@ -416,11 +443,11 @@ def test_invalid_group_args_rejected():
 @pytest.mark.parametrize(
     "routing_method,n_group,topk_group",
     [
-        # Only the grouped DeepSeek kernel populates the fused shared-expert
-        # slots. Every other method dispatches to routingCustom, which leaves
-        # them untouched, so they must reject num_fused_shared_experts > 0
-        # rather than hand back uninitialized slots.
-        pytest.param(RoutingMethodType.DeepSeekV3, 1, 1, id="DeepSeekV3_no_groups"),
+        # Only the DeepSeek kernel populates the fused shared-expert slots
+        # (DeepSeekV3 with fused shared experts always uses it, grouped or not).
+        # Every other method dispatches to routingCustom, which leaves them
+        # untouched, so they must reject num_fused_shared_experts > 0 rather
+        # than hand back uninitialized slots.
         pytest.param(RoutingMethodType.MiniMax2, 0, 0, id="MiniMax2"),
         pytest.param(RoutingMethodType.Renormalize, 0, 0, id="Renormalize"),
         pytest.param(RoutingMethodType.Llama4, 0, 0, id="Llama4"),

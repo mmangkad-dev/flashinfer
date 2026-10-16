@@ -62,12 +62,16 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
                  bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
-  if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
-    // Only the grouped DeepSeek kernel below populates the fused shared-expert
-    // slots; routingCustom leaves them untouched, so reject rather than return
-    // uninitialized slots (same guard as the Llama4 and generic branches).
+  if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1 &&
+      (numFusedSharedExpert == 0 || expertIds != nullptr || routingLogits == nullptr)) {
+    // routingCustom does not populate fused shared-expert slots. With fused shared
+    // experts and logits input, no-groups DeepSeek routing falls through to the
+    // DeepSeek kernel below, which runs ungrouped when nGroup <= 1 and appends the
+    // shared slots. Precomputed top-k (unpacked ids, or packed ids with no logits)
+    // skips that kernel's main pass, so keep rejecting it.
     FLASHINFER_CHECK(numFusedSharedExpert == 0,
-                     "DeepSeek no-groups routing path does not support fusing shared expert");
+                     "DeepSeek no-groups routing with precomputed expert ids does not support "
+                     "fusing shared expert");
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
     // and ScaledSumNormalize postprocess. This is more efficient than the full DeepSeek
     // kernel because it uses the warp-level routingTopKExperts flow.

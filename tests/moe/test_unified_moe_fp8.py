@@ -1240,6 +1240,8 @@ def _make_shared_expert_case(
     activation=None,
     shared_scale=4.0,
     num_experts=SHARED_EXPERTS_E,
+    n_group=SHARED_N_GROUP,
+    topk_group=SHARED_TOPK_GROUP,
 ):
     """Build a DSv3 case with distinguishable shared rows.
 
@@ -1303,8 +1305,8 @@ def _make_shared_expert_case(
             num_experts=num_experts,
             top_k=TOP_K,
             method=RoutingMethodType.DeepSeekV3,
-            n_group=SHARED_N_GROUP,
-            topk_group=SHARED_TOPK_GROUP,
+            n_group=n_group,
+            topk_group=topk_group,
             routed_scaling_factor=SHARED_ROUTED_SCALE,
         ),
         quant=variant,
@@ -1427,19 +1429,28 @@ def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
         runner.pack_inputs(pack, weights)
 
 
-def test_block_fp8_fused_shared_experts_contribute():
+@pytest.mark.parametrize(
+    "n_group,topk_group",
+    [
+        pytest.param(SHARED_N_GROUP, SHARED_TOPK_GROUP, id="grouped"),
+        # No-groups routing with shared experts takes the ungrouped DeepSeek kernel.
+        pytest.param(1, 1, id="no-groups"),
+    ],
+)
+def test_block_fp8_fused_shared_experts_contribute(n_group, topk_group):
     """Verify shared rows contribute independently of the legacy cross-check."""
     variant = QuantConfig(
         weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
     )
     num_shared = 1
+    grouping = dict(n_group=n_group, topk_group=topk_group)
     pack, weights, config, _, _ = _make_shared_expert_case(
-        variant, num_shared=num_shared
+        variant, num_shared=num_shared, **grouping
     )
     live = MoELayer(config)(pack, weights).clone()
 
     pack0, weights0, config0, _, _ = _make_shared_expert_case(
-        variant, num_shared=num_shared, shared_scale=0.0
+        variant, num_shared=num_shared, shared_scale=0.0, **grouping
     )
     muted = MoELayer(config0)(pack0, weights0).clone()
 

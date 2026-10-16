@@ -1943,6 +1943,81 @@ def test_fp4_block_scale_moe_fused_shared_routing_replay(num_tokens, num_shared)
     )
 
 
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
+def test_fp4_routed_no_groups_fused_shared_rejected(routing_format):
+    """No-groups DeepSeekV3 with precomputed ids must reject fused shared experts;
+    only the logits path appends the shared-expert slots."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    num_tokens, hidden_size, intermediate_size = 8, 1024, 512
+    num_experts, top_k, num_shared = 16, 2, 1
+    device = torch.device("cuda:0")
+    rows = num_experts + num_shared
+    global_sf = torch.tensor([448.0 * 6.0], device=device)
+    hidden_states, hidden_states_scale = fp4_quantize(
+        torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16),
+        global_sf,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+        is_sf_swizzled_layout=False,
+    )
+    w13, w13_scale = fp4_quantize(
+        torch.randn(rows, 2 * intermediate_size, hidden_size, device=device).bfloat16(),
+        global_sf,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+    )
+    w2, w2_scale = fp4_quantize(
+        torch.randn(rows, hidden_size, intermediate_size, device=device).bfloat16(),
+        global_sf,
+        sf_vec_size=16,
+        sf_use_ue8m0=False,
+    )
+    scalar = torch.ones(rows, device=device, dtype=torch.float32)
+    # The launcher requires top_k + S ids per token, so the call reaches routing.
+    ids = torch.randint(0, num_experts, (num_tokens, top_k), device=device)
+    ids = torch.cat([ids, torch.full_like(ids[:, :num_shared], num_experts)], 1).int()
+    weights = torch.ones(ids.shape, device=device, dtype=torch.bfloat16)
+    if routing_format == "packed":
+        routing_input = (ids << 16) | weights.view(torch.int16).int().bitwise_and(
+            0xFFFF
+        )
+    else:
+        routing_input = (ids, weights)
+    with pytest.raises(Exception, match="precomputed expert ids"):
+        trtllm_fp4_block_scale_routed_moe(
+            routing_input,
+            None,
+            hidden_states,
+            hidden_states_scale.view(torch.float8_e4m3fn).reshape(num_tokens, -1),
+            w13,
+            w13_scale.view(torch.float8_e4m3fn).reshape(
+                rows, 2 * intermediate_size, -1
+            ),
+            None,
+            None,
+            None,
+            None,
+            w2,
+            w2_scale.view(torch.float8_e4m3fn).reshape(rows, hidden_size, -1),
+            None,
+            scalar,
+            scalar.clone(),
+            scalar.clone(),
+            num_experts,
+            top_k,
+            1,  # n_group
+            1,  # topk_group
+            intermediate_size,
+            0,
+            num_experts,
+            2.5,
+            routing_method_type=RoutingMethodType.DeepSeekV3.value,
+            num_fused_shared_experts=num_shared,
+        )
+        torch.cuda.synchronize()
+
+
 # Each (num_tokens, num_experts) entry is chosen to land in exactly one of the
 # five top-K kernels in `routing_custom.cu`. See the dispatch logic comment in
 # `trtllm_fused_moe_routing_custom.cuh` (around the `useSplitTopKPath` block):
